@@ -1,1 +1,210 @@
+from google.colab import drive
+drive.mount('/content/drive')
 
+# Unzip the dataset (make sure archive.zip is in the same folder)
+!unzip -q "/content/drive/MyDrive/archive.zip" -d /content/animals10
+
+
+
+import os, shutil, numpy as np
+import matplotlib.pyplot as plt
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+base_dir = '/content/animals10/raw-img'
+train_dir, val_dir = '/content/animals10/train', '/content/animals10/val'
+IMG_SIZE, BATCH_SIZE = (224, 224), 16
+
+os.makedirs(train_dir, exist_ok=True)
+os.makedirs(val_dir, exist_ok=True)
+classes = os.listdir(base_dir)
+
+for cls in classes:
+    os.makedirs(os.path.join(train_dir, cls), exist_ok=True)
+    os.makedirs(os.path.join(val_dir, cls), exist_ok=True)
+    images = os.listdir(os.path.join(base_dir, cls))
+    np.random.shuffle(images)
+    split = int(0.8 * len(images))
+    for img in images[:split]:
+        shutil.copy(os.path.join(base_dir, cls, img), os.path.join(train_dir, cls, img))
+    for img in images[split:]:
+        shutil.copy(os.path.join(base_dir, cls, img), os.path.join(val_dir, cls, img))
+
+train_generator = ImageDataGenerator(rescale=1./255).flow_from_directory(
+    train_dir, target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='categorical')
+val_generator = ImageDataGenerator(rescale=1./255).flow_from_directory(
+    val_dir, target_size=IMG_SIZE, batch_size=BATCH_SIZE, class_mode='categorical')
+
+
+
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv2D, MaxPooling2D, Flatten, Dense, Dropout
+
+zfnet_model = Sequential([
+    Conv2D(96, (7,7), strides=2, activation='relu', input_shape=(224, 224, 3)),
+    MaxPooling2D(pool_size=(3,3), strides=2),
+    Conv2D(256, (5,5), activation='relu'),
+    MaxPooling2D(pool_size=(3,3), strides=2),
+    Conv2D(384, (3,3), activation='relu'),
+    Conv2D(384, (3,3), activation='relu'),
+    Conv2D(256, (3,3), activation='relu'),
+    MaxPooling2D(pool_size=(3,3), strides=2),
+    Flatten(),
+    Dense(4096, activation='relu'), Dropout(0.5),
+    Dense(4096, activation='relu'), Dropout(0.5),
+    Dense(10, activation='softmax')
+])
+zfnet_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+zfnet_model.summary()
+
+
+from tensorflow.keras.applications import VGG16
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import GlobalAveragePooling2D
+
+base_model = VGG16(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
+for layer in base_model.layers:
+    layer.trainable = False
+
+x = base_model.output
+x = GlobalAveragePooling2D()(x)
+x = Dense(1024, activation='relu')(x)
+predictions = Dense(10, activation='softmax')(x)
+
+vgg_model = Model(inputs=base_model.input, outputs=predictions)
+vgg_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+vgg_model.summary()
+
+
+
+from tensorflow.keras.layers import Input, concatenate
+
+def inception_module(x, f1, f3_in, f3_out, f5_in, f5_out, pool_proj):
+    conv1 = Conv2D(f1, (1,1), padding='same', activation='relu')(x)
+    conv3 = Conv2D(f3_in, (1,1), padding='same', activation='relu')(x)
+    conv3 = Conv2D(f3_out, (3,3), padding='same', activation='relu')(conv3)
+    conv5 = Conv2D(f5_in, (1,1), padding='same', activation='relu')(x)
+    conv5 = Conv2D(f5_out, (5,5), padding='same', activation='relu')(conv5)
+    pool = MaxPooling2D((3,3), strides=(1,1), padding='same')(x)
+    pool = Conv2D(pool_proj, (1,1), padding='same', activation='relu')(pool)
+    return concatenate([conv1, conv3, conv5, pool], axis=-1)
+
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dropout, GlobalAveragePooling2D
+
+input_layer = Input(shape=(224, 224, 3))
+x = Conv2D(64, (7,7), strides=2, padding='same', activation='relu')(input_layer)
+x = MaxPooling2D((3,3), strides=2, padding='same')(x)
+x = Conv2D(64, (1,1), activation='relu')(x)
+x = Conv2D(192, (3,3), padding='same', activation='relu')(x)
+x = MaxPooling2D((3,3), strides=2, padding='same')(x)
+x = inception_module(x, 64, 96, 128, 16, 32, 32)
+x = inception_module(x, 128, 128, 192, 32, 96, 64)
+x = MaxPooling2D((3,3), strides=2, padding='same')(x)
+x = inception_module(x, 192, 96, 208, 16, 48, 64)
+x = inception_module(x, 160, 112, 224, 24, 64, 64)
+x = inception_module(x, 128, 128, 256, 24, 64, 64)
+x = inception_module(x, 112, 144, 288, 32, 64, 64)
+x = inception_module(x, 256, 160, 320, 32, 128, 128)
+x = MaxPooling2D((3,3), strides=2, padding='same')(x)
+x = inception_module(x, 256, 160, 320, 32, 128, 128)
+x = GlobalAveragePooling2D()(x)
+x = Dropout(0.4)(x)
+output = Dense(10, activation='softmax')(x)
+
+googlenet_model = Model(inputs=input_layer, outputs=output)
+googlenet_model.compile(optimizer='adam', loss='categorical_crossentropy', metrics=['accuracy'])
+googlenet_model.summary()
+
+
+
+
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+
+def train_model(model, model_name):
+    checkpoint = ModelCheckpoint(f"{model_name}_best.h5", monitor='val_accuracy', save_best_only=True, verbose=1)
+    early_stop = EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True, verbose=1)
+    history = model.fit(
+        train_generator,
+        validation_data=val_generator,
+        epochs=5,
+        callbacks=[checkpoint, early_stop],
+        verbose=1
+    )
+    return history
+
+history_zfnet = train_model(zfnet_model, "zfnet")
+history_vgg = train_model(vgg_model, "vgg16")
+history_googlenet = train_model(googlenet_model, "googlenet")
+
+
+
+
+plt.figure(figsize=(12, 5))
+
+if 'val_accuracy' in history_zfnet.history:
+    plt.plot(history_zfnet.history['val_accuracy'], label='ZFNet', marker='o', color='blue')
+
+if 'val_accuracy' in history_vgg.history:
+    plt.plot(history_vgg.history['val_accuracy'], label='VGG16', marker='s', color='green')
+
+if 'val_accuracy' in history_googlenet.history:
+    plt.plot(history_googlenet.history['val_accuracy'], label='GoogLeNet', marker='^', color='red')
+
+plt.title('Validation Accuracy Comparison')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+
+
+
+
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+import numpy as np
+import time
+from google.colab import files
+
+# Translation dictionary
+translate = {
+    "cane": "dog", "cavallo": "horse", "elefante": "elephant", "farfalla": "butterfly", "gallina": "chicken",
+    "gatto": "cat", "mucca": "cow", "pecora": "sheep", "scoiattolo": "squirrel", "spider": "ragno",
+    "dog": "cane", "horse": "cavallo", "elephant": "elefante", "butterfly": "farfalla", "chicken": "gallina",
+    "cat": "gatto", "cow": "mucca", "squirrel": "scoiattolo"
+}
+
+def read_image(file_path):
+    image = load_img(file_path, target_size=IMG_SIZE)
+    image = img_to_array(image)
+    image = np.expand_dims(image, axis=0)
+    image /= 255.
+    return image
+
+def test_single_image(path, model, generator_ref):
+    image = read_image(path)
+    time.sleep(0.5)
+    preds = model.predict(image)
+    animals = list(generator_ref.class_indices.keys())
+
+    print("\nPrediction Scores:")
+    for idx, animal, x in zip(range(len(animals)), animals, preds[0]):
+        print("ID: {}, Label: {} -> {}%".format(idx, animal, round(x * 100, 2)))
+
+    print('\nFinal Decision:')
+    for x in range(3):
+        print('.' * (x + 1))
+        time.sleep(0.2)
+
+    predicted_class = np.argmax(preds)
+    label = animals[predicted_class]
+    translated_label = translate.get(label, "Translation not found")
+
+    print("Predicted Label:", translated_label)
+
+    return load_img(path)
+
+# Upload and test
+uploaded = files.upload()
+test_path = list(uploaded.keys())[0]
+test_single_image(test_path, vgg_model, train_generator)
